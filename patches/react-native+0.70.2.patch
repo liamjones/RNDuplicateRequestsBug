@@ -1,0 +1,117 @@
+diff --git a/node_modules/react-native/Libraries/Network/RCTHTTPRequestHandler.mm b/node_modules/react-native/Libraries/Network/RCTHTTPRequestHandler.mm
+index 7b54592..bc9c68c 100644
+--- a/node_modules/react-native/Libraries/Network/RCTHTTPRequestHandler.mm
++++ b/node_modules/react-native/Libraries/Network/RCTHTTPRequestHandler.mm
+@@ -186,6 +186,96 @@ didReceiveResponse:(NSURLResponse *)response
+   [delegate URLRequest:task didCompleteWithError:error];
+ }
+ 
++- (void) URLSession:(NSURLSession *)session
++               task:(NSURLSessionTask *)task
++didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge
++  completionHandler:(void (^)(NSURLSessionAuthChallengeDisposition, NSURLCredential *))completionHandler {
++  if (challenge.protectionSpace.authenticationMethod != NSURLAuthenticationMethodHTTPBasic) {
++    completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
++    return;
++  }
++
++  // We already handled the challenge in the last call to didReceiveChallenge and the credentials are still incorrect so
++  // give up
++  if (challenge.proposedCredential != nil && challenge.previousFailureCount > 0) {
++    // Stops an extra request from happening (compared to the option below) but results in network request failed in JS
++    // layer but seems like the *correct* completion type. RN's iOS code would probably need more of a fundamental change
++    // to ensure the 401 response still gets back to the JS layer
++//    completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge, nil);
++
++    // This *does* result in a 401 back in the JS layer but feels like the wrong completion type and also results in a
++    // 3rd request with no Authorization header if the response was 401 when the Authorization header was present. If
++    // the auth call resulted in a different response code (for example, 429) then the 3rd request doesn't get sent and
++    // the 429 is returned correctly to the JS layer
++    completionHandler(NSURLSessionAuthChallengeRejectProtectionSpace, nil);
++    return;
++  }
++
++  NSString *wasAuthHeaderValue = [task.currentRequest valueForHTTPHeaderField:@"Was-Authorization"];
++
++  if (wasAuthHeaderValue == nil) {
++    completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
++    return;
++  }
++
++  NSError *regexError = nil;
++  NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"^\s*Basic\\s+([A-Z0-9+/]+={0,2})\s*"
++                                                                         options:NSRegularExpressionCaseInsensitive
++                                                                           error:&regexError];
++  NSTextCheckingResult *match = [regex firstMatchInString:wasAuthHeaderValue
++                                                  options:0
++                                                    range:NSMakeRange(0, wasAuthHeaderValue.length)];
++  if (!match) {
++    completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
++    return;
++  }
++
++  NSRange basicAuthValueRange = [match rangeAtIndex:1];
++  if (NSEqualRanges(basicAuthValueRange, NSMakeRange(NSNotFound, 0))) {
++    completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
++    return;
++  }
++
++  NSString *basicAuthBase64EncodedValue = [wasAuthHeaderValue substringWithRange:basicAuthValueRange];
++  NSData *data = [[NSData alloc] initWithBase64EncodedString:basicAuthBase64EncodedValue options:0];
++  if (data == nil) {
++    completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
++    return;
++  }
++
++  NSString *decodedBasicAuthValue = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
++  if (decodedBasicAuthValue == nil) {
++    completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
++    return;
++  }
++
++  const NSRange &rangeOfFirstColon = [decodedBasicAuthValue rangeOfString:@":"];
++  if (NSEqualRanges(rangeOfFirstColon, NSMakeRange(NSNotFound, 0))) {
++    completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
++    return;
++  }
++
++  NSString *username = [decodedBasicAuthValue substringWithRange:NSMakeRange(0, rangeOfFirstColon.location)];
++  NSUInteger passwordOffset = rangeOfFirstColon.location + rangeOfFirstColon.length;
++  const NSRange &passwordRange = NSMakeRange(passwordOffset, decodedBasicAuthValue.length - passwordOffset);
++  NSString *password = [decodedBasicAuthValue substringWithRange:passwordRange];
++  NSURLCredential *credential = [NSURLCredential credentialWithUser:username
++                                                           password:password
++                                                        persistence:NSURLCredentialPersistenceNone];
++
++  completionHandler(NSURLSessionAuthChallengeUseCredential, credential);
++  return;
++}
++
++- (void) URLSession:(NSURLSession *)session
++didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge
++  completionHandler:(void (^)(NSURLSessionAuthChallengeDisposition, NSURLCredential *))completionHandler {
++  // Just do the default handling. Implemented so we don't get the task challenge handler receiving all the
++  // NSURLAuthenticationMethodServerTrust challenges.
++  completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
++}
++
++
+ - (std::shared_ptr<facebook::react::TurboModule>)getTurboModule:
+     (const facebook::react::ObjCTurboModule::InitParams &)params
+ {
+diff --git a/node_modules/react-native/Libraries/Network/RCTNetworking.mm b/node_modules/react-native/Libraries/Network/RCTNetworking.mm
+index a0dcbed..1d594cd 100644
+--- a/node_modules/react-native/Libraries/Network/RCTNetworking.mm
++++ b/node_modules/react-native/Libraries/Network/RCTNetworking.mm
+@@ -307,6 +307,11 @@ RCT_EXPORT_MODULE()
+     }
+   }];
+ 
++  // Rename auth header so it doesn't trigger double request
++  NSString *authHeaderValue = [request valueForHTTPHeaderField:@"Authorization"];
++  [request setValue:authHeaderValue forHTTPHeaderField:@"Was-Authorization"];
++  [request setValue:nil forHTTPHeaderField:@"Authorization"];
++
+   request.timeoutInterval = [RCTConvert NSTimeInterval:query[@"timeout"]];
+   NSDictionary<NSString *, id> *data = [RCTConvert NSDictionary:RCTNilIfNull(query[@"data"])];
+   NSString *trackingName = data[@"trackingName"];
